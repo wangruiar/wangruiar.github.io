@@ -1,0 +1,1076 @@
+<p>远程直接内存访问(即Remote Direct Memory Access)是一种直接内存访问技术，它让计算机可以直接存取其他计算机的内存，而不需要经过操作系统和处理器耗时的处理。RDMA将数据从一个系统快速移动到远程系统存储器中，不对操作系统造成任何影响。</p>
+
+<p><img src="https://5b0988e595225.cdn.sohucs.com/images/20180422/c32ef99c45bc418ba29a08d56ae6fbfa.jpeg" alt="支持 RDMA 协议的设备" /></p>
+
+<p>RDMA技术最早出现在Infiniband网络，用于HPC高性能计算集群的互联。支持 RDMA 协议的设备主要有 Infiniband、RoCE、iWARP 网卡，在 HPC、并行存储系统等领域得到广泛应用。</p>
+
+<h2 id="rdma-vs-tcpip">RDMA VS TCP/IP</h2>
+
+<p>传统的基于Socket套接字(TCP/IP协议栈)的网络通信，需要经过操作系统软件协议栈，数据在系统DRAM、处理器Cache和网卡Buffer之间来回拷贝搬移，因此占用了大量的CPU计算资源和内存总线带宽，也加大了网络延时。举例来说，40Gbps的TCP/IP流能耗尽主流服务器的所有CPU资源；RDMA则解决了传统TCP/IP通信的技术痛点。例如，在40Gbps场景下，CPU占用率从100%下降到5%，网络延时从ms级降低到10us以下。</p>
+
+<p>RDMA技术的原理及其与TCP/IP架构的对比如下图所示。</p>
+
+<p><img src="https://5b0988e595225.cdn.sohucs.com/images/20180422/22acd08a57d548e0a83ebd88958b5e1e.jpeg" alt="RDMA技术的原理及其与TCP/IP架构的对比" /></p>
+
+<p>因此，自我理解RDMA为利用相关的硬件和网络技术，服务器的网卡之间可以直接读内存，最终达到高带宽、低延迟和低资源占用率的效果。应用程序不需要参与数据传输过程，只需要指定内存读写地址，开启传输并等待传输完成即可。</p>
+
+<h2 id="rdma的三种实现">RDMA的三种实现</h2>
+
+<p>目前RDMA有三种不同的硬件实现。分别是InfiniBand、iWarp（internet Wide Area RDMA Protocol）、RoCE(RDMA over Converged Ethernet)。其中，Infiniband是一种专为RDMA设计的网络，从硬件级别保证可靠传输 ， 而RoCE 和 iWARP都是基于以太网的RDMA技术，支持相应的verbs接口，如下图所示。</p>
+
+<p><img src="https://img-blog.csdn.net/20180604110329770" alt="三种实现的协议栈" /></p>
+
+<p>从图中不难发现，RoCE协议存在RoCEv1和RoCEv2两个版本，主要区别RoCEv1是基于以太网链路层实现的RDMA协议(交换机需要支持PFC等流控技术，在物理层保证可靠传输)，而RoCEv2是以太网TCP/IP协议中UDP层实现。从性能上，很明显Infiniband网络最好，但网卡和交换机是价格也很高，然而RoCEv2和iWARP仅需使用特殊的网卡就可以了，价格也相对便宜很多。</p>
+
+<p>自己归纳一下，三种实现之间的区别：</p>
+
+<ol>
+  <li>IB网是从硬件上支持RDMA，各方面性能上最优，但是对硬件成本要求最高，需要支持该技术的网卡和交换机。</li>
+  <li>一个允许在以太网上执行RDMA的网络协议。 其较低的网络标头是以太网标头，其较高的网络标头（包括数据）是InfiniBand标头。 这支持在标准以太网基础设施（交换机）上使用RDMA。 只有网卡应该是特殊的，支持RoCE。</li>
+  <li>iWarp一个允许在TCP上执行RDMA的网络协议，可能比普通以太网还要慢，不适合用于生产环境。只有网卡应该是特殊的，并且支持iWARP（如果使用CPU卸载），否则所有iWARP堆栈都可以在SW中实现，并且丧失了大部分RDMA性能优势。IB和RoCE中存在的功能在iWARP中不受支持。 这支持在标准以太网基础设施（交换机）上使用RDMA。</li>
+</ol>
+
+<h2 id="相关概念">相关概念</h2>
+
+<h3 id="qpqueue-pair">QP(Queue Pair)</h3>
+
+<p>Queue Pairs(QP)，每对QP由Send Queue(SQ)和Receive Queue(RQ)构成，这些队列中管理着各种类型的消息。QP会被映射到应用的虚拟地址空间，使得应用直接通过它访问RNIC网卡。</p>
+
+<h3 id="cqcomplete-queue">CQ(Complete Queue)</h3>
+
+<p>完成队列包含了发送到工作队列（WQ）中已完成的工作请求（WR）。每次完成表示一个特定的 WR执行完毕（包括成功完成的WR和不成功完成的WR）。完成队列是一个用来告知应用程序已结束的工作请求的信息（状态、操作码、大小、来源）的机制。CQ有n个完成队列实体（CQE）。CQE的数量在CQ创建的时候被指定。当一个CQP被轮询到，它就从CQ中被删除。CQ是一个CQE的先进选出（FIFO）队列。CQ能服务于发送队列、接收队列或者同时服务于这两种队列。多个不同QP中的工作请求（WQ）可联系到同一个CQ上。</p>
+
+<h3 id="mrmemory-region">MR(Memory Region)</h3>
+
+<p>内存注册机制允许应用程序申请一些连续的虚拟内存空间或者连续的物理内存空间，将这些内存空间提供给网络适配器作为虚拟的连续缓冲区，缓冲区使用虚拟地址。内存注册进程锁定了内存页。（为了防止页被替换出去，同时保持物理和虚拟内存的映射）在注册期间，操作系统检查被注册块的许可。注册进程将虚拟地址与物理地址的映射表写入网络适配器。在注册内存时，对应内存区域的权限会被设定。权限包括本地写、远程读、远程写、原子操作、绑定。每个内存注册（MR）有一个远程的和一个本地的标志（r_key，l_key）。本地标志被本地的HCA 用来访问本地内存，例如在接收数据操作的期间。远程标志提供给远程HCA用来在RDMA操作期间允许远程进程访问本地的系统内存。同一内存缓冲区可以被多次注册（甚至设置不同的操作权限），并且每次注册都会生成不同的标志。</p>
+
+<h3 id="发送请求sr">发送请求（SR）</h3>
+
+<p>SR定义了数据的发送量、从哪里、发送方式、是否通过RDMA、到哪里。</p>
+
+<p>RR定义用来放置通过非RDMA操作接收到的数据的缓冲区。如没有定义缓冲区，并且有个传输者 尝试执行一个发送操作或者一个带立即数的RDMA写操作，那么接收者将会发出接收未就绪的错误（RNR）。</p>
+
+<h3 id="接收请求rr">接收请求（RR）</h3>
+
+<p>RR定义用来放置通过非RDMA操作接收到的数据的缓冲区。如没有定义缓冲区，并且有个传输者 尝试执行一个发送操作或者一个带立即数的RDMA写操作，那么接收者将会发出接收未就绪的错误（RNR）。</p>
+
+<h2 id="rdma工作过程">RDMA工作过程</h2>
+
+<ol>
+  <li>当一个应用执行RDMA 读或写请求时，不执行任何数据复制.在不需要任何内核内存参与的条件下，RDMA 请求从运行在用户空间中的应用中发送到本地NIC( 网卡)。</li>
+  <li>NIC 读取缓冲的内容，并通过网络传送到远程NIC。</li>
+  <li>在网络上传输的RDMA 信息包含目标虚拟地址、内存钥匙和数据本身.请求既可以完全在用户空间中处理(通过轮询用户级完成排列) ，又或者在应用一直睡眠到请求完成时的情况下通过系统中断处理.RDMA 操作使应用可以从一个远程应用的内存中读数据或向这个内存写数据。</li>
+  <li>目标NIC 确认内存钥匙，直接将数据写人应用缓存中.用于操作的远程虚拟内存地址包含在RDMA 信息中。</li>
+</ol>
+
+<h2 id="reviewtcp通信流程">Review：TCP通信流程</h2>
+
+<h3 id="server">Server</h3>
+
+<ol>
+  <li>调用<code class="highlighter-rouge">socket()</code>创建一个套接字</li>
+  <li>调用<code class="highlighter-rouge">bind()</code>绑定到一个端口</li>
+  <li>调用<code class="highlighter-rouge">listen()</code>监听该端口</li>
+  <li>调用<code class="highlighter-rouge">accept()</code>等待客户端连接上来(阻塞)</li>
+  <li>建立TCP连接</li>
+  <li>调用<code class="highlighter-rouge">send()</code>/<code class="highlighter-rouge">receive()</code>通过该连接进行通信</li>
+</ol>
+
+<h3 id="client">Client</h3>
+
+<ol>
+  <li>调用<code class="highlighter-rouge">socket()</code>创建一个套接字</li>
+  <li>调用<code class="highlighter-rouge">connect()</code>连上服务端</li>
+  <li>建立TCP连接</li>
+  <li>调用<code class="highlighter-rouge">send()</code>/<code class="highlighter-rouge">receive()</code>通过该连接进行通信</li>
+</ol>
+
+<h2 id="rdma通信流程">RDMA通信流程</h2>
+
+<h3 id="获取rdma设备列表ibv_get_device_list">获取RDMA设备列表（<code class="highlighter-rouge">ibv_get_device_list</code>）</h3>
+
+<p>获得机器上的RDMA设备。有点像CUDA。</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 1 获取设备列表 */</span>
+	<span class="kt">int</span> <span class="n">num_devices</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_device</span> <span class="o">**</span><span class="n">dev_list</span> <span class="o">=</span> <span class="n">ibv_get_device_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">num_devices</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev_list</span> <span class="o">||</span> <span class="o">!</span><span class="n">num_devices</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to get IB devices</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="打开一个rdma设备获取一个上下文ibv_open_deviceibv_context">打开一个RDMA设备，获取一个上下文（ibv_open_device、ibv_context）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 2 打开设备，获取设备上下文 */</span>
+	<span class="k">struct</span> <span class="n">ibv_device</span> <span class="o">*</span><span class="n">ib_dev</span> <span class="o">=</span> <span class="n">dev_list</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span> <span class="o">=</span> <span class="n">ibv_open_device</span><span class="p">(</span><span class="n">ib_dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to open device </span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="释放rdma设备列表占用的资源ibv_free_device_list">释放RDMA设备列表占用的资源（ibv_free_device_list）</h3>
+
+<p>个人理解这一步是在给前两步擦屁股…因为通常需要操作的是单个RDMA设备，而第一步获得的是一个列表。多余的部分自然是要释放掉。</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 3 释放设备列表占用的资源 */</span>
+	<span class="n">ibv_free_device_list</span><span class="p">(</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="n">dev_list</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">ib_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+</code></pre></div></div>
+
+<h3 id="查询rdma设备端口信息ibv_query_portibv_port_attr">查询RDMA设备端口信息（ibv_query_port、ibv_port_attr）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 4 查询设备端口状态 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ibv_query_port</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">res</span><span class="p">.</span><span class="n">port_attr</span><span class="p">))</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_query_port on port failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="分配一个protection-domainibv_alloc_pdibv_pd">分配一个Protection Domain（ibv_alloc_pd、ibv_pd）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 5 创建PD（Protection Domain） */</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">pd</span> <span class="o">=</span> <span class="n">ibv_alloc_pd</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_alloc_pd failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="创建一个complete-queueibv_create_cqibv_cq">创建一个Complete Queue（ibv_create_cq、ibv_cq）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 6 创建CQ（Complete Queue） */</span>
+	<span class="kt">int</span> <span class="n">cq_size</span> <span class="o">=</span> <span class="mi">10</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">cq</span> <span class="o">=</span> <span class="n">ibv_create_cq</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">,</span> <span class="n">cq_size</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to create CQ with %u entries</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">cq_size</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="注册一块memory-regionibv_reg_mribv_mr">注册一块Memory Region（ibv_reg_mr、ibv_mr）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 7 注册MR（Memory Region） */</span>
+	<span class="kt">int</span> <span class="n">size</span> <span class="o">=</span> <span class="n">MSG_SIZE</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">buf</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to malloc %Zu bytes to memory buffer</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+
+	<span class="kt">int</span> <span class="n">mr_flags</span> <span class="o">=</span> <span class="n">IBV_ACCESS_LOCAL_WRITE</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_READ</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_WRITE</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">mr</span> <span class="o">=</span> <span class="n">ibv_reg_mr</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_reg_mr failed with mr_flags=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+			<span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">lkey</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">rkey</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h3 id="创建一个queue-pairibv_create_qpibv_qp">创建一个Queue Pair（ibv_create_qp、ibv_qp）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 8 创建QP（Queue Pair） */</span>
+	<span class="k">struct</span> <span class="n">ibv_qp_init_attr</span> <span class="n">qp_init_attr</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">qp_init_attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">qp_init_attr</span><span class="p">));</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">qp_type</span> <span class="o">=</span> <span class="n">IBV_QPT_RC</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">sq_sig_all</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">send_cq</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">recv_cq</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_send_wr</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_recv_wr</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_send_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_recv_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">qp</span> <span class="o">=</span> <span class="n">ibv_create_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">qp_init_attr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to create QP</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"QP was created, QP number=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="o">-&gt;</span><span class="n">qp_num</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h3 id="交换控制信息使用socket或rdma_cm-api">交换控制信息（使用Socket或RDMA_CM API）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 9 交换控制信息 */</span>
+	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">local_con_data</span><span class="p">;</span>  <span class="c1">// 发送给远程主机的信息
+</span>	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">remote_con_data</span><span class="p">;</span> <span class="c1">// 接收远程主机发送过来的信息
+</span>	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">tmp_con_data</span><span class="p">;</span>
+
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">htonll</span><span class="p">((</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">htonl</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">qp_num</span> <span class="o">=</span> <span class="n">htonl</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="o">-&gt;</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">lid</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">port_attr</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sock_sync_data</span><span class="p">(</span><span class="n">server_ip</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">cm_con_data_t</span><span class="p">),</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">local_con_data</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">tmp_con_data</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to exchange connection data between sides</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">ntohll</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">addr</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">qp_num</span> <span class="o">=</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">lid</span> <span class="o">=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+	<span class="cm">/* save the remote side attributes, we will need it for the post SR */</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">remote_props</span> <span class="o">=</span> <span class="n">remote_con_data</span><span class="p">;</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote address = 0x%"</span> <span class="n">PRIx64</span> <span class="s">"</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">addr</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote rkey = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote QP number = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote LID = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h3 id="转换qp状态reset-init-rtr-rtsibv_modify_qp">转换QP状态RESET-&gt;INIT-&gt;RTR-&gt;RTS（ibv_modify_qp）</h3>
+
+<ul>
+  <li>状态：RESET -&gt; INIT -&gt; RTR -&gt; RTS</li>
+  <li>要严格按照顺序进行转换</li>
+  <li>QP刚创建时状态为RESET</li>
+  <li>INIT之后就可以调用ibv_post_recv提交一个receive buffer了</li>
+  <li>当 QP进入RTR(ready to receive)状态以后，便开始进行接收处理</li>
+  <li>RTR之后便可以转为RTS(ready to send)，RTS状态下可以调用ibv_post_send</li>
+</ul>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 10 转换QP状态 */</span>
+	<span class="c1">// RESET -&gt; INIT
+</span>	<span class="k">struct</span> <span class="n">ibv_qp_attr</span> <span class="n">attr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_INIT</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">port_num</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="c1">// IB 端口号
+</span>	<span class="n">attr</span><span class="p">.</span><span class="n">pkey_index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_access_flags</span> <span class="o">=</span> <span class="n">IBV_ACCESS_LOCAL_WRITE</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_READ</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_WRITE</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_PKEY_INDEX</span> <span class="o">|</span> <span class="n">IBV_QP_PORT</span> <span class="o">|</span> <span class="n">IBV_QP_ACCESS_FLAGS</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to INIT</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+	<span class="c1">//INIT -&gt; RTR(Ready To Receive)
+</span>	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_RTR</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">path_mtu</span> <span class="o">=</span> <span class="n">IBV_MTU_256</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">dest_qp_num</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">qp_num</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">rq_psn</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">max_dest_rd_atomic</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">min_rnr_timer</span> <span class="o">=</span> <span class="mh">0x12</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">is_global</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">dlid</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">lid</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">sl</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">src_path_bits</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">port_num</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_AV</span> <span class="o">|</span> <span class="n">IBV_QP_PATH_MTU</span> <span class="o">|</span> <span class="n">IBV_QP_DEST_QPN</span> <span class="o">|</span> <span class="n">IBV_QP_RQ_PSN</span> <span class="o">|</span> <span class="n">IBV_QP_MAX_DEST_RD_ATOMIC</span> <span class="o">|</span> <span class="n">IBV_QP_MIN_RNR_TIMER</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to RTR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+	<span class="c1">//RTR -&gt; RTS(Ready To Send)
+</span>	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_RTS</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">timeout</span> <span class="o">=</span> <span class="mh">0x12</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">retry_cnt</span> <span class="o">=</span> <span class="mi">6</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">rnr_retry</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">sq_psn</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">max_rd_atomic</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_TIMEOUT</span> <span class="o">|</span> <span class="n">IBV_QP_RETRY_CNT</span> <span class="o">|</span> <span class="n">IBV_QP_RNR_RETRY</span> <span class="o">|</span> <span class="n">IBV_QP_SQ_PSN</span> <span class="o">|</span> <span class="n">IBV_QP_MAX_QP_RD_ATOMIC</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to RTS</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h3 id="创建发送任务接收任务ibv_send_wr--ibv_recv_wr">创建发送任务/接收任务（ibv_send_wr / ibv_recv_wr）</h3>
+
+<ul>
+  <li>ibv_send_wr（send work request）</li>
+  <li>该任务会被提交到QP中的SQ（Send Queue）中</li>
+  <li>发送任务有三种操作：Send,Read,Write</li>
+  <li>Send操作需要对方执行相应的Receive操作</li>
+  <li>Read/Write直接操作对方内存，对方无感知</li>
+  <li>把要发送的数据的内存地址，大小，密钥告诉HCA</li>
+  <li>Read/Write还需要告诉HCA远程的内存地址和密钥</li>
+</ul>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 11 创建发送任务ibv_send_wr */</span>
+	<span class="k">struct</span> <span class="n">ibv_send_wr</span> <span class="n">sr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_sge</span> <span class="n">sge</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_send_wr</span> <span class="o">*</span><span class="n">bad_wr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="cm">/* prepare the scatter/gather entry */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sge</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sge</span><span class="p">));</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">MSG_SIZE</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">lkey</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">lkey</span><span class="p">;</span>
+	<span class="cm">/* prepare the send work request */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sr</span><span class="p">));</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">wr_id</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">sg_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sge</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">num_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">opcode</span> <span class="o">=</span> <span class="n">opcode</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">send_flags</span> <span class="o">=</span> <span class="n">IBV_SEND_SIGNALED</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">opcode</span> <span class="o">!=</span> <span class="n">IBV_WR_SEND</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">sr</span><span class="p">.</span><span class="n">wr</span><span class="p">.</span><span class="n">rdma</span><span class="p">.</span><span class="n">remote_addr</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">remote_props</span><span class="p">.</span><span class="n">addr</span><span class="p">;</span>
+		<span class="n">sr</span><span class="p">.</span><span class="n">wr</span><span class="p">.</span><span class="n">rdma</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">remote_props</span><span class="p">.</span><span class="n">rkey</span><span class="p">;</span>
+	<span class="p">}</span>
+</code></pre></div></div>
+
+<h3 id="提交发送任务接收任务ibv_post_send--ibv_post_recv">提交发送任务/接收任务（ibv_post_send / ibv_post_recv）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_post_send</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bad_wr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to post SR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+</code></pre></div></div>
+
+<h3 id="轮询任务完成信息ibv_poll_cq">轮询任务完成信息（ibv_poll_cq）</h3>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>	<span class="cm">/* 13 轮询任务结果 */</span>
+	<span class="k">struct</span> <span class="n">ibv_wc</span> <span class="n">wc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">poll_result</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">do</span>
+	<span class="p">{</span>
+		<span class="n">poll_result</span> <span class="o">=</span> <span class="n">ibv_poll_cq</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">cq</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wc</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">poll_result</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h2 id="完整示例代码rdma_read_write_democ">完整示例代码（<code class="highlighter-rouge">RDMA_Read_Write_Demo.c</code>）</h2>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cm">/*
+* BUILD COMMAND:
+* gcc -Wall  -o RDMA_Read_Write_Demo   RDMA_Read_Write_Demo.c -libverbs
+*/</span>
+<span class="cm">/******************************************************************************
+*
+* RDMA Aware Networks Programming Example
+*
+* This code demonstrates how to perform the following operations using the * VPI Verbs API:
+*
+* Send
+* Receive
+* RDMA Read
+* RDMA Write
+*
+*****************************************************************************/</span>
+
+<span class="cp">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;inttypes.h&gt;
+#include &lt;endian.h&gt;
+#include &lt;byteswap.h&gt;
+#include &lt;getopt.h&gt;
+</span>
+<span class="cp">#include &lt;sys/time.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;infiniband/verbs.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;netdb.h&gt;
+</span>
+<span class="cm">/* poll CQ timeout in millisec (2 seconds) */</span>
+<span class="cp">#define MAX_POLL_CQ_TIMEOUT 20000
+#define MSG "SEND operation "
+#define MSG_SIZE 1048576 //1MB
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+</span><span class="k">static</span> <span class="kr">inline</span> <span class="kt">uint64_t</span> <span class="nf">htonll</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">x</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="n">bswap_64</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="p">}</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">uint64_t</span> <span class="nf">ntohll</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">x</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="n">bswap_64</span><span class="p">(</span><span class="n">x</span><span class="p">);</span> <span class="p">}</span>
+<span class="cp">#elif __BYTE_ORDER == __BIG_ENDIAN
+</span><span class="k">static</span> <span class="kr">inline</span> <span class="kt">uint64_t</span> <span class="nf">htonll</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">x</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="n">x</span><span class="p">;</span> <span class="p">}</span>
+<span class="k">static</span> <span class="kr">inline</span> <span class="kt">uint64_t</span> <span class="nf">ntohll</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">x</span><span class="p">)</span> <span class="p">{</span> <span class="k">return</span> <span class="n">x</span><span class="p">;</span> <span class="p">}</span>
+<span class="cp">#else
+#error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
+#endif
+</span>
+<span class="cm">/* structure to exchange data which is needed to connect the QPs */</span>
+<span class="k">struct</span> <span class="n">cm_con_data_t</span>
+<span class="p">{</span>
+	<span class="kt">uint64_t</span> <span class="n">addr</span><span class="p">;</span>   <span class="cm">/* Buffer address */</span>
+	<span class="kt">uint32_t</span> <span class="n">rkey</span><span class="p">;</span>   <span class="cm">/* Remote key */</span>
+	<span class="kt">uint32_t</span> <span class="n">qp_num</span><span class="p">;</span> <span class="cm">/* QP number */</span>
+	<span class="kt">uint16_t</span> <span class="n">lid</span><span class="p">;</span>	<span class="cm">/* LID of the IB port */</span>
+<span class="p">}</span> <span class="n">__attribute__</span><span class="p">((</span><span class="n">packed</span><span class="p">));</span>
+
+<span class="cm">/* structure of system resources */</span>
+<span class="k">struct</span> <span class="n">resources</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">ibv_device_attr</span> <span class="n">device_attr</span><span class="p">;</span> <span class="cm">/* Device attributes */</span>
+	<span class="k">struct</span> <span class="n">ibv_port_attr</span> <span class="n">port_attr</span><span class="p">;</span>		<span class="cm">/* IB port attributes */</span>
+	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">remote_props</span><span class="p">;</span>  <span class="cm">/* values to connect to remote side */</span>
+	<span class="k">struct</span> <span class="n">ibv_context</span> <span class="o">*</span><span class="n">ib_ctx</span><span class="p">;</span>			<span class="cm">/* device handle */</span>
+	<span class="k">struct</span> <span class="n">ibv_pd</span> <span class="o">*</span><span class="n">pd</span><span class="p">;</span>					<span class="cm">/* PD handle */</span>
+	<span class="k">struct</span> <span class="n">ibv_cq</span> <span class="o">*</span><span class="n">cq</span><span class="p">;</span>					<span class="cm">/* CQ handle */</span>
+	<span class="k">struct</span> <span class="n">ibv_qp</span> <span class="o">*</span><span class="n">qp</span><span class="p">;</span>					<span class="cm">/* QP handle */</span>
+	<span class="k">struct</span> <span class="n">ibv_mr</span> <span class="o">*</span><span class="n">mr</span><span class="p">;</span>					<span class="cm">/* MR handle for buf */</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">buf</span><span class="p">;</span>							<span class="cm">/* memory buffer pointer */</span>
+<span class="p">};</span>
+
+<span class="cm">/******************************************************************************
+* Function: sock_connect
+*
+* Input
+* servername URL of server to connect to (NULL for server mode)
+* port port of service
+*
+* Output
+* none
+*
+* Returns
+* socket (fd) on success, negative error code on failure
+*
+* Description
+* Connect a socket. If servername is specified a client connection will be
+* initiated to the indicated server and port. Otherwise listen on the
+* indicated port for an incoming connection.
+*
+******************************************************************************/</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">sock_connect</span><span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">servername</span><span class="p">,</span> <span class="kt">int</span> <span class="n">port</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">addrinfo</span> <span class="o">*</span><span class="n">resolved_addr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">addrinfo</span> <span class="o">*</span><span class="n">iterator</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="n">service</span><span class="p">[</span><span class="mi">6</span><span class="p">];</span>
+	<span class="kt">int</span> <span class="n">sockfd</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">listenfd</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">tmp</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">addrinfo</span> <span class="n">hints</span> <span class="o">=</span>
+		<span class="p">{</span>
+			<span class="p">.</span><span class="n">ai_flags</span> <span class="o">=</span> <span class="n">AI_PASSIVE</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">ai_family</span> <span class="o">=</span> <span class="n">AF_INET</span><span class="p">,</span>
+			<span class="p">.</span><span class="n">ai_socktype</span> <span class="o">=</span> <span class="n">SOCK_STREAM</span><span class="p">};</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">sprintf</span><span class="p">(</span><span class="n">service</span><span class="p">,</span> <span class="s">"%d"</span><span class="p">,</span> <span class="n">port</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="k">goto</span> <span class="n">sock_connect_exit</span><span class="p">;</span>
+	<span class="cm">/* Resolve DNS address, use sockfd as temp storage */</span>
+	<span class="n">sockfd</span> <span class="o">=</span> <span class="n">getaddrinfo</span><span class="p">(</span><span class="n">servername</span><span class="p">,</span> <span class="n">service</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">hints</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">resolved_addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sockfd</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"%s for %s:%d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">gai_strerror</span><span class="p">(</span><span class="n">sockfd</span><span class="p">),</span> <span class="n">servername</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+		<span class="k">goto</span> <span class="n">sock_connect_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* Search through results and find the one we want */</span>
+	<span class="k">for</span> <span class="p">(</span><span class="n">iterator</span> <span class="o">=</span> <span class="n">resolved_addr</span><span class="p">;</span> <span class="n">iterator</span><span class="p">;</span> <span class="n">iterator</span> <span class="o">=</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_next</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">sockfd</span> <span class="o">=</span> <span class="n">socket</span><span class="p">(</span><span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_family</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_socktype</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_protocol</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sockfd</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="p">{</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">servername</span><span class="p">)</span>
+			<span class="p">{</span>
+				<span class="cm">/* Client mode. Initiate connection to remote */</span>
+				<span class="k">if</span> <span class="p">((</span><span class="n">tmp</span> <span class="o">=</span> <span class="n">connect</span><span class="p">(</span><span class="n">sockfd</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_addr</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_addrlen</span><span class="p">)))</span>
+				<span class="p">{</span>
+					<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"failed connect </span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+					<span class="n">close</span><span class="p">(</span><span class="n">sockfd</span><span class="p">);</span>
+					<span class="n">sockfd</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+				<span class="p">}</span>
+			<span class="p">}</span>
+			<span class="k">else</span>
+			<span class="p">{</span>
+				<span class="cm">/* Server mode. Set up listening socket an accept a connection */</span>
+				<span class="n">listenfd</span> <span class="o">=</span> <span class="n">sockfd</span><span class="p">;</span>
+				<span class="n">sockfd</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+				<span class="k">if</span> <span class="p">(</span><span class="n">bind</span><span class="p">(</span><span class="n">listenfd</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_addr</span><span class="p">,</span> <span class="n">iterator</span><span class="o">-&gt;</span><span class="n">ai_addrlen</span><span class="p">))</span>
+					<span class="k">goto</span> <span class="n">sock_connect_exit</span><span class="p">;</span>
+				<span class="n">listen</span><span class="p">(</span><span class="n">listenfd</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+				<span class="n">sockfd</span> <span class="o">=</span> <span class="n">accept</span><span class="p">(</span><span class="n">listenfd</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+			<span class="p">}</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+<span class="nl">sock_connect_exit:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">listenfd</span><span class="p">)</span>
+		<span class="n">close</span><span class="p">(</span><span class="n">listenfd</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">resolved_addr</span><span class="p">)</span>
+		<span class="n">freeaddrinfo</span><span class="p">(</span><span class="n">resolved_addr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sockfd</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">servername</span><span class="p">)</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"Couldn't connect to %s:%d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">servername</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+		<span class="k">else</span>
+		<span class="p">{</span>
+			<span class="n">perror</span><span class="p">(</span><span class="s">"server accept"</span><span class="p">);</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"accept() failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">sockfd</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/******************************************************************************
+* Function: sock_sync_data
+*
+* Input
+Table 5 -
+* sock socket to transfer data on
+* xfer_size size of data to transfer
+* local_data pointer to data to be sent to remote (local_data是一个指向要发送到远程的数据的指针)
+*
+* Output
+* remote_data pointer to buffer to receive remote data
+*
+* Returns
+* 0 on success, negative error code on failure
+*
+* Description
+* Sync data across a socket. The indicated local data will be sent to the
+* remote. It will then wait for the remote to send its data back. It is
+* assumed that the two sides are in sync and call this function in the proper
+* order. Chaos will ensue if they are not. :)
+*
+* Also note this is a blocking function and will wait for the full data to be
+* received from the remote.
+*
+******************************************************************************/</span>
+<span class="kt">int</span> <span class="nf">sock_sync_data</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="n">server_ip</span><span class="p">,</span> <span class="kt">int</span> <span class="n">xfer_size</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">local_data</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">remote_data</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">sock</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">port</span> <span class="o">=</span> <span class="mi">10002</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">server_ip</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">sock</span> <span class="o">=</span> <span class="n">sock_connect</span><span class="p">(</span><span class="n">server_ip</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sock</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to establish TCP connection to server %s, port %d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+					<span class="n">server_ip</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">else</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"waiting on port %d for TCP connection</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+		<span class="n">sock</span> <span class="o">=</span> <span class="n">sock_connect</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span> <span class="n">port</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">sock</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to establish TCP connection with client</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"TCP connection was established</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+	<span class="kt">int</span> <span class="n">read_bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">total_read_bytes</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">write</span><span class="p">(</span><span class="n">sock</span><span class="p">,</span> <span class="n">local_data</span><span class="p">,</span> <span class="n">xfer_size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span> <span class="o">&lt;</span> <span class="n">xfer_size</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"Failed writing data during sock_sync_data</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+	<span class="k">else</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="o">!</span><span class="n">rc</span> <span class="o">&amp;&amp;</span> <span class="n">total_read_bytes</span> <span class="o">&lt;</span> <span class="n">xfer_size</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">read_bytes</span> <span class="o">=</span> <span class="n">read</span><span class="p">(</span><span class="n">sock</span><span class="p">,</span> <span class="n">remote_data</span><span class="p">,</span> <span class="n">xfer_size</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">read_bytes</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+			<span class="n">total_read_bytes</span> <span class="o">+=</span> <span class="n">read_bytes</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="n">read_bytes</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">sleep</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span> <span class="c1">//sleep 2s
+</span>	<span class="k">if</span> <span class="p">(</span><span class="n">sock</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+		<span class="n">close</span><span class="p">(</span><span class="n">sock</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="cm">/******************************************************************************
+End of socket operations
+******************************************************************************/</span>
+
+<span class="cm">/* poll_completion */</span>
+<span class="cm">/******************************************************************************
+* Function: poll_completion
+*
+* Input
+* res pointer to resources structure
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, 1 on failure
+*
+* Description
+* Poll the completion queue for a single event. This function will continue to
+* poll the queue until MAX_POLL_CQ_TIMEOUT milliseconds have passed. (轮询获得一个CQ事件)
+*
+******************************************************************************/</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">poll_completion</span><span class="p">(</span><span class="k">struct</span> <span class="n">resources</span> <span class="o">*</span><span class="n">res</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* 13 轮询任务结果 */</span>
+	<span class="k">struct</span> <span class="n">ibv_wc</span> <span class="n">wc</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">poll_result</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">do</span>
+	<span class="p">{</span>
+		<span class="n">poll_result</span> <span class="o">=</span> <span class="n">ibv_poll_cq</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">cq</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">wc</span><span class="p">);</span>
+	<span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">poll_result</span> <span class="o">==</span> <span class="mi">0</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">poll_result</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="cm">/* poll CQ failed */</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"poll CQ failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="k">else</span>
+	<span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">wc</span><span class="p">.</span><span class="n">status</span> <span class="o">!=</span> <span class="n">IBV_WC_SUCCESS</span><span class="p">)</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"got bad completion with status: 0x%x, vendor syndrome: 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">wc</span><span class="p">.</span><span class="n">status</span><span class="p">,</span>
+					<span class="n">wc</span><span class="p">.</span><span class="n">vendor_err</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/******************************************************************************
+* Function: post_send
+*
+* Input
+* res pointer to resources structure
+* opcode IBV_WR_SEND, IBV_WR_RDMA_READ or IBV_WR_RDMA_WRITE
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, error code on failure
+*
+* Description
+* This function will create and post a send work request
+******************************************************************************/</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">post_send</span><span class="p">(</span><span class="k">struct</span> <span class="n">resources</span> <span class="o">*</span><span class="n">res</span><span class="p">,</span> <span class="kt">int</span> <span class="n">opcode</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* 11 创建发送任务ibv_send_wr */</span>
+	<span class="k">struct</span> <span class="n">ibv_send_wr</span> <span class="n">sr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_sge</span> <span class="n">sge</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_send_wr</span> <span class="o">*</span><span class="n">bad_wr</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="cm">/* prepare the scatter/gather entry */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sge</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sge</span><span class="p">));</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">MSG_SIZE</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">lkey</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">lkey</span><span class="p">;</span>
+	<span class="cm">/* prepare the send work request */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sr</span><span class="p">));</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">wr_id</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">sg_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sge</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">num_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">opcode</span> <span class="o">=</span> <span class="n">opcode</span><span class="p">;</span>
+	<span class="n">sr</span><span class="p">.</span><span class="n">send_flags</span> <span class="o">=</span> <span class="n">IBV_SEND_SIGNALED</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">opcode</span> <span class="o">!=</span> <span class="n">IBV_WR_SEND</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">sr</span><span class="p">.</span><span class="n">wr</span><span class="p">.</span><span class="n">rdma</span><span class="p">.</span><span class="n">remote_addr</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">remote_props</span><span class="p">.</span><span class="n">addr</span><span class="p">;</span>
+		<span class="n">sr</span><span class="p">.</span><span class="n">wr</span><span class="p">.</span><span class="n">rdma</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">remote_props</span><span class="p">.</span><span class="n">rkey</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="cm">/* 12 提交发送任务 */</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_post_send</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bad_wr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to post SR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/******************************************************************************
+* Function: post_receive
+*
+* Input
+* res pointer to resources structure
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, error code on failure
+*
+* Description
+*
+******************************************************************************/</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">post_receive</span><span class="p">(</span><span class="k">struct</span> <span class="n">resources</span> <span class="o">*</span><span class="n">res</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="cm">/* 11 创建接收任务ibv_resv_wr */</span>
+	<span class="k">struct</span> <span class="n">ibv_recv_wr</span> <span class="n">rr</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_sge</span> <span class="n">sge</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_recv_wr</span> <span class="o">*</span><span class="n">bad_wr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span><span class="p">;</span>
+	<span class="cm">/* prepare the scatter/gather entry */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sge</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">sge</span><span class="p">));</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="p">(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">length</span> <span class="o">=</span> <span class="n">MSG_SIZE</span><span class="p">;</span>
+	<span class="n">sge</span><span class="p">.</span><span class="n">lkey</span> <span class="o">=</span> <span class="n">res</span><span class="o">-&gt;</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">lkey</span><span class="p">;</span>
+	<span class="cm">/* prepare the receive work request */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">rr</span><span class="p">));</span>
+	<span class="n">rr</span><span class="p">.</span><span class="n">next</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">rr</span><span class="p">.</span><span class="n">wr_id</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">rr</span><span class="p">.</span><span class="n">sg_list</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">sge</span><span class="p">;</span>
+	<span class="n">rr</span><span class="p">.</span><span class="n">num_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="cm">/* 12 提交接收任务 */</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_post_recv</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rr</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">bad_wr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to post RR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/******************************************************************************
+* Function: resources_destroy
+*
+* Input
+* res pointer to resources structure
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, 1 on failure
+*
+* Description
+* Cleanup and deallocate all resources used
+******************************************************************************/</span>
+<span class="k">static</span> <span class="kt">int</span> <span class="nf">resources_destroy</span><span class="p">(</span><span class="k">struct</span> <span class="n">resources</span> <span class="o">*</span><span class="n">res</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">qp</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ibv_destroy_qp</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">qp</span><span class="p">))</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to destroy QP</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">mr</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ibv_dereg_mr</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">mr</span><span class="p">))</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to deregister MR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">)</span>
+		<span class="n">free</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">buf</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">cq</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ibv_destroy_cq</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">cq</span><span class="p">))</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to destroy CQ</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">pd</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ibv_dealloc_pd</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">pd</span><span class="p">))</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to deallocate PD</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ib_ctx</span><span class="p">)</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">ibv_close_device</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ib_ctx</span><span class="p">))</span>
+		<span class="p">{</span>
+			<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to close device context</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/******************************************************************************
+* Function: main
+*
+* Input
+* argc number of items in argv
+* argv command line parameters
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, 1 on failure
+*
+* Description
+* Main program code
+******************************************************************************/</span>
+<span class="kt">int</span> <span class="nf">main</span><span class="p">(</span><span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">argv</span><span class="p">[])</span>
+<span class="p">{</span>
+	<span class="k">struct</span> <span class="n">resources</span> <span class="n">res</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="kt">char</span> <span class="o">*</span><span class="n">server_ip</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">optind</span> <span class="o">==</span> <span class="n">argc</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+		<span class="n">server_ip</span> <span class="o">=</span> <span class="n">argv</span><span class="p">[</span><span class="n">optind</span><span class="p">];</span> <span class="c1">//获取客户端连接服务器的IP
+</span>
+	<span class="cm">/* init all of the resources, so cleanup will be easy */</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span> <span class="n">res</span><span class="p">);</span>
+
+	<span class="cm">/* 1 获取设备列表 */</span>
+	<span class="kt">int</span> <span class="n">num_devices</span><span class="p">;</span>
+	<span class="k">struct</span> <span class="n">ibv_device</span> <span class="o">**</span><span class="n">dev_list</span> <span class="o">=</span> <span class="n">ibv_get_device_list</span><span class="p">(</span><span class="o">&amp;</span><span class="n">num_devices</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">dev_list</span> <span class="o">||</span> <span class="o">!</span><span class="n">num_devices</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to get IB devices</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 2 打开设备，获取设备上下文 */</span>
+	<span class="k">struct</span> <span class="n">ibv_device</span> <span class="o">*</span><span class="n">ib_dev</span> <span class="o">=</span> <span class="n">dev_list</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span> <span class="o">=</span> <span class="n">ibv_open_device</span><span class="p">(</span><span class="n">ib_dev</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to open device </span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 3 释放设备列表占用的资源 */</span>
+	<span class="n">ibv_free_device_list</span><span class="p">(</span><span class="n">dev_list</span><span class="p">);</span>
+	<span class="n">dev_list</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+	<span class="n">ib_dev</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+	<span class="cm">/* 4 查询设备端口状态 */</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">ibv_query_port</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">res</span><span class="p">.</span><span class="n">port_attr</span><span class="p">))</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_query_port on port failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 5 创建PD（Protection Domain） */</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">pd</span> <span class="o">=</span> <span class="n">ibv_alloc_pd</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_alloc_pd failed</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 6 创建CQ（Complete Queue） */</span>
+	<span class="kt">int</span> <span class="n">cq_size</span> <span class="o">=</span> <span class="mi">10</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">cq</span> <span class="o">=</span> <span class="n">ibv_create_cq</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">ib_ctx</span><span class="p">,</span> <span class="n">cq_size</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to create CQ with %u entries</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">cq_size</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="cm">/* 7 注册MR（Memory Region） */</span>
+	<span class="kt">int</span> <span class="n">size</span> <span class="o">=</span> <span class="n">MSG_SIZE</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">buf</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to malloc %Zu bytes to memory buffer</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+
+	<span class="kt">int</span> <span class="n">mr_flags</span> <span class="o">=</span> <span class="n">IBV_ACCESS_LOCAL_WRITE</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_READ</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_WRITE</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">mr</span> <span class="o">=</span> <span class="n">ibv_reg_mr</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"ibv_reg_mr failed with mr_flags=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+			<span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">lkey</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">rkey</span><span class="p">,</span> <span class="n">mr_flags</span><span class="p">);</span>
+
+	<span class="cm">/* 8 创建QP（Queue Pair） */</span>
+	<span class="k">struct</span> <span class="n">ibv_qp_init_attr</span> <span class="n">qp_init_attr</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">qp_init_attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">qp_init_attr</span><span class="p">));</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">qp_type</span> <span class="o">=</span> <span class="n">IBV_QPT_RC</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">sq_sig_all</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">send_cq</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">recv_cq</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">cq</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_send_wr</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_recv_wr</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_send_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">qp_init_attr</span><span class="p">.</span><span class="n">cap</span><span class="p">.</span><span class="n">max_recv_sge</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">qp</span> <span class="o">=</span> <span class="n">ibv_create_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">pd</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">qp_init_attr</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to create QP</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"QP was created, QP number=0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="o">-&gt;</span><span class="n">qp_num</span><span class="p">);</span>
+
+	<span class="cm">/* 9 交换控制信息 */</span>
+	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">local_con_data</span><span class="p">;</span>  <span class="c1">// 发送给远程主机的信息
+</span>	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">remote_con_data</span><span class="p">;</span> <span class="c1">// 接收远程主机发送过来的信息
+</span>	<span class="k">struct</span> <span class="n">cm_con_data_t</span> <span class="n">tmp_con_data</span><span class="p">;</span>
+
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">htonll</span><span class="p">((</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">htonl</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">mr</span><span class="o">-&gt;</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">qp_num</span> <span class="o">=</span> <span class="n">htonl</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="o">-&gt;</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">local_con_data</span><span class="p">.</span><span class="n">lid</span> <span class="o">=</span> <span class="n">htons</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">port_attr</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">sock_sync_data</span><span class="p">(</span><span class="n">server_ip</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">cm_con_data_t</span><span class="p">),</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">local_con_data</span><span class="p">,</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">tmp_con_data</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to exchange connection data between sides</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+		<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">addr</span> <span class="o">=</span> <span class="n">ntohll</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">addr</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">rkey</span> <span class="o">=</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">qp_num</span> <span class="o">=</span> <span class="n">ntohl</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">remote_con_data</span><span class="p">.</span><span class="n">lid</span> <span class="o">=</span> <span class="n">ntohs</span><span class="p">(</span><span class="n">tmp_con_data</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+	<span class="cm">/* save the remote side attributes, we will need it for the post SR */</span>
+	<span class="n">res</span><span class="p">.</span><span class="n">remote_props</span> <span class="o">=</span> <span class="n">remote_con_data</span><span class="p">;</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote address = 0x%"</span> <span class="n">PRIx64</span> <span class="s">"</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">addr</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote rkey = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">rkey</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote QP number = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">qp_num</span><span class="p">);</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"Remote LID = 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">remote_con_data</span><span class="p">.</span><span class="n">lid</span><span class="p">);</span>
+
+	<span class="cm">/* 10 转换QP状态 */</span>
+	<span class="c1">// RESET -&gt; INIT
+</span>	<span class="k">struct</span> <span class="n">ibv_qp_attr</span> <span class="n">attr</span><span class="p">;</span>
+	<span class="kt">int</span> <span class="n">flags</span><span class="p">;</span>
+	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_INIT</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">port_num</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="c1">// IB 端口号
+</span>	<span class="n">attr</span><span class="p">.</span><span class="n">pkey_index</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_access_flags</span> <span class="o">=</span> <span class="n">IBV_ACCESS_LOCAL_WRITE</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_READ</span> <span class="o">|</span> <span class="n">IBV_ACCESS_REMOTE_WRITE</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_PKEY_INDEX</span> <span class="o">|</span> <span class="n">IBV_QP_PORT</span> <span class="o">|</span> <span class="n">IBV_QP_ACCESS_FLAGS</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to INIT</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+	<span class="c1">//INIT -&gt; RTR(Ready To Receive)
+</span>	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_RTR</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">path_mtu</span> <span class="o">=</span> <span class="n">IBV_MTU_256</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">dest_qp_num</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">qp_num</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">rq_psn</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">max_dest_rd_atomic</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">min_rnr_timer</span> <span class="o">=</span> <span class="mh">0x12</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">is_global</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">dlid</span> <span class="o">=</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">lid</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">sl</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">src_path_bits</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">ah_attr</span><span class="p">.</span><span class="n">port_num</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_AV</span> <span class="o">|</span> <span class="n">IBV_QP_PATH_MTU</span> <span class="o">|</span> <span class="n">IBV_QP_DEST_QPN</span> <span class="o">|</span> <span class="n">IBV_QP_RQ_PSN</span> <span class="o">|</span> <span class="n">IBV_QP_MAX_DEST_RD_ATOMIC</span> <span class="o">|</span> <span class="n">IBV_QP_MIN_RNR_TIMER</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to RTR</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+	<span class="c1">//RTR -&gt; RTS(Ready To Send)
+</span>	<span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">attr</span><span class="p">));</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">qp_state</span> <span class="o">=</span> <span class="n">IBV_QPS_RTS</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">timeout</span> <span class="o">=</span> <span class="mh">0x12</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">retry_cnt</span> <span class="o">=</span> <span class="mi">6</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">rnr_retry</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">sq_psn</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="n">attr</span><span class="p">.</span><span class="n">max_rd_atomic</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="n">flags</span> <span class="o">=</span> <span class="n">IBV_QP_STATE</span> <span class="o">|</span> <span class="n">IBV_QP_TIMEOUT</span> <span class="o">|</span> <span class="n">IBV_QP_RETRY_CNT</span> <span class="o">|</span> <span class="n">IBV_QP_RNR_RETRY</span> <span class="o">|</span> <span class="n">IBV_QP_SQ_PSN</span> <span class="o">|</span> <span class="n">IBV_QP_MAX_QP_RD_ATOMIC</span><span class="p">;</span>
+	<span class="n">rc</span> <span class="o">=</span> <span class="n">ibv_modify_qp</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">qp</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">attr</span><span class="p">,</span> <span class="n">flags</span><span class="p">);</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">rc</span><span class="p">)</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to modify QP state to RTS</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+	<span class="kt">int</span> <span class="n">choice</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+	<span class="p">{</span>
+		<span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n\n\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">printf</span><span class="p">(</span><span class="s">"*********************************************************************************************</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">printf</span><span class="p">(</span><span class="s">"* 1:RDMA_READ 2:RDMA_WRITE 3:SEND 4:RECEIVE 5:Read Local Buffer 6:Write Local Buffer 7:Exit *</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">printf</span><span class="p">(</span><span class="s">"*********************************************************************************************</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">printf</span><span class="p">(</span><span class="s">"please input your choice : "</span><span class="p">);</span>
+		<span class="n">scanf</span><span class="p">(</span><span class="s">"%d"</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">choice</span><span class="p">);</span>
+		<span class="n">getchar</span><span class="p">();</span>
+		<span class="k">switch</span> <span class="p">(</span><span class="n">choice</span><span class="p">)</span>
+		<span class="p">{</span>
+		<span class="k">case</span> <span class="mi">1</span><span class="p">:</span>
+			<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">);</span>
+			<span class="n">post_send</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">,</span> <span class="n">IBV_WR_RDMA_READ</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">poll_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">))</span>
+			<span class="p">{</span>
+				<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"poll completion failed 2</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">else</span>
+			<span class="p">{</span>
+				<span class="n">printf</span><span class="p">(</span><span class="s">"Reading remote's buffer(addr:0x%x, rkey:0x%x) : %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">addr</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">rkey</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">2</span><span class="p">:</span>
+			<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">);</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"Writing remote's buffer(addr:0x%x, rkey:0x%x) : "</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">addr</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">remote_props</span><span class="p">.</span><span class="n">rkey</span><span class="p">);</span>
+			<span class="n">fgets</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">,</span> <span class="n">stdin</span><span class="p">);</span>
+			<span class="n">post_send</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">,</span> <span class="n">IBV_WR_RDMA_WRITE</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">poll_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">))</span>
+			<span class="p">{</span>
+				<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"poll completion failed 2</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">else</span>
+			<span class="p">{</span>
+				<span class="n">printf</span><span class="p">(</span><span class="s">"success</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">3</span><span class="p">:</span>
+			<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">);</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"Sending : "</span><span class="p">);</span>
+			<span class="n">fgets</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">,</span> <span class="n">stdin</span><span class="p">);</span>
+			<span class="n">post_send</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">,</span> <span class="n">IBV_WR_SEND</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">poll_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">))</span>
+			<span class="p">{</span>
+				<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"poll completion failed 2</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">else</span>
+			<span class="p">{</span>
+				<span class="n">printf</span><span class="p">(</span><span class="s">"success</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">4</span><span class="p">:</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"receiving: "</span><span class="p">);</span>
+			<span class="n">post_receive</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">);</span>
+			<span class="k">if</span> <span class="p">(</span><span class="n">poll_completion</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">))</span>
+			<span class="p">{</span>
+				<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"poll completion failed 2</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">else</span>
+			<span class="p">{</span>
+				<span class="n">printf</span><span class="p">(</span><span class="s">"%s"</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+			<span class="p">}</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">5</span><span class="p">:</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"Reading local buffer(addr:0x%x): %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="p">(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">6</span><span class="p">:</span>
+			<span class="n">memset</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">);</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"Writing local buffer(addr:0x%x) : %s"</span><span class="p">,</span> <span class="p">(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">);</span>
+			<span class="n">fgets</span><span class="p">(</span><span class="n">res</span><span class="p">.</span><span class="n">buf</span><span class="p">,</span> <span class="n">MSG_SIZE</span><span class="p">,</span> <span class="n">stdin</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+
+		<span class="k">case</span> <span class="mi">7</span><span class="p">:</span>
+			<span class="k">goto</span> <span class="n">main_exit</span><span class="p">;</span>
+
+		<span class="nl">default:</span>
+			<span class="n">printf</span><span class="p">(</span><span class="s">"invalid choice.</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+			<span class="k">break</span><span class="p">;</span>
+		<span class="p">}</span>
+	<span class="p">}</span>
+
+	<span class="n">rc</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="nl">main_exit:</span>
+	<span class="k">if</span> <span class="p">(</span><span class="n">resources_destroy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">res</span><span class="p">))</span>
+	<span class="p">{</span>
+		<span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span> <span class="s">"failed to destroy resources</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+		<span class="n">rc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+	<span class="p">}</span>
+	<span class="n">fprintf</span><span class="p">(</span><span class="n">stdout</span><span class="p">,</span> <span class="s">"</span><span class="se">\n</span><span class="s">test result is %d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">rc</span><span class="p">);</span>
+	<span class="k">return</span> <span class="n">rc</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<h2 id="参考材料">参考材料</h2>
+
+<ul>
+  <li><a href="http://www.mellanox.com/related-docs/prod_software/RDMA_Aware_Programming_user_manual.pdf">官方文档</a></li>
+  <li><a href="https://www.rdmamojo.com">博客</a></li>
+</ul>
